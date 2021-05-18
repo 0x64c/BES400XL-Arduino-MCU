@@ -11,5 +11,7 @@ Current features:
 * Preinfusion (pumps a bit of water into the basket on brew and startup)
 
 Todo:
+* Timed automatic shut-off
+* Connect a buzzer to the arduino
 * USB Serial control and feedback
 * Heater and brew time calibration
