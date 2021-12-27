@@ -1,3 +1,22 @@
+//isr timer
+#define TIMER_INTERRUPT_DEBUG 0
+#define _TIMERINTERRUPT_LOGLEVEL_ 0
+#define USE_TIMER_1 true
+#include "TimerInterrupt.h"
+
+//time durations in ms
+#define STEAM_DURATION 300000
+#define BREW_DURATION 18000
+#define ONE_SECOND 1000
+#define AUTO_SHUTDOWN_TIME 900000
+#define TIMER_INTERVAL_MS 20
+
+//time constants in frames
+#define BLINK_FRAMES 25
+#define MIN_STABLE_FRAMES 10
+#define HEATER_FRAMES 40
+
+//pin values
 #define PIN_HEATER 8
 #define PIN_PUMP 9
 #define PIN_LED_ON 12
@@ -6,387 +25,288 @@
 #define PIN_BUTTONS 14
 #define PIN_TEMP 15
 
+//analogue voltage thresholds
+//buttons
 #define BTN_VOLT_POWER  0x100
 #define BTN_VOLT_COFFEE 0x200
 #define BTN_VOLT_STEAM  0x300
 #define BTN_VOLT_NONE   0x400
+//thermistor
+#define BREWING_TEMPERATURE 0x200
+#define STEAMING_TEMPERATURE 0x148
+
+//helpful macros
+#define SET_PIN(b,a) digitalWrite(b,((a > 0) ? LOW : HIGH))
+#define SET_HEATER(a) digitalWrite(PIN_HEATER,((a > 0) ? LOW : HIGH))
+#define SET_PUMP(a) digitalWrite(PIN_PUMP,((a > 0) ? HIGH : LOW))
+
+//functional states
+#define OFF_STATE 0
+#define COFFEE_STATE 1
+#define COFFEE_BREWING 2
+#define STEAM_STATE 3
+//temperature states
+#define COLD 0
+#define COFFEE_READY 1
+#define STEAM_READY 2
+//button states
 #define BTN_NONE 0
 #define BTN_POWER 1
 #define BTN_COFFEE 2
 #define BTN_STEAM 3
 
-#define BREWING_TEMPERATURE 0x200
-#define STEAMING_TEMPERATURE 0x148
-#define STEAM_DURATION 300000
-#define BREW_DURATION 18000
-#define TEMP_REGULATION_DELAY 100
-#define ONE_SECOND 1000
-#define AUTO_SHUTDOWN_TIME 900000
-
 //machine status
-int Heater = 0;
-int Pump = 0;
-int ButtonState = 0;
-int LastButtonState = 0;
-#define POWER_OFF 0b0
-#define COFFEE_TIME 0b1
-#define STEAM_TIME 0b10
-//#define TEMP_CALIBRATION 0b100
-#define COFFEE_TEMP 0b1000
-#define STEAM_TEMP 0b10000
-#define BREWING 0b100000
-unsigned int machineState = POWER_OFF;
+volatile int button_state = BTN_NONE;
+volatile int func_state = OFF_STATE;
+volatile int temp_state = COLD;
+
+volatile int isr_started = 0;
+void TimerHandler()
+{
+  //temperature regulation
+  static int this_temp;
+  static int heaterframes;
+  //input handling
+  static int this_button_state;
+  static int last_button_state;
+  static int button_reading;
+  static int frames_stable;
+  //led
+  static int blinkframes;
+  static int blinkylights;
+
+  //initialize local variables
+  if(!isr_started){
+    this_temp = 0x0;
+    frames_stable = 0;
+    blinkframes = 0;
+    blinkylights = 0;
+    heaterframes = 0;
+    button_reading = BTN_VOLT_NONE;
+    this_button_state = BTN_NONE;
+    last_button_state = BTN_NONE;
+    isr_started=1;
+  }
+  
+  //read button input
+  button_reading = analogRead(PIN_BUTTONS);
+  //decode and store current button state
+  if ( button_reading < BTN_VOLT_POWER ){
+    this_button_state = BTN_POWER;
+  }else if ( button_reading < BTN_VOLT_COFFEE ){
+    this_button_state = BTN_COFFEE;
+  }else if ( button_reading < BTN_VOLT_STEAM ){
+    this_button_state = BTN_STEAM;
+  }else{
+    this_button_state = BTN_NONE;
+  }
+
+  //keep track of how many frames the button state has been stable for
+  if(this_button_state==last_button_state){
+    frames_stable += 1;
+  }else{
+    frames_stable = 0;
+  }
+
+  //if button state has been stable for long enough, store the value in global
+  if(frames_stable == MIN_STABLE_FRAMES){
+    button_state = this_button_state;
+  }
+
+  //store the last button state
+  last_button_state = this_button_state;
+
+  //regulate temp
+  heaterframes++;
+  //check if enough frames have passed
+  if(heaterframes>HEATER_FRAMES){
+    heaterframes=0;
+    this_temp = analogRead(PIN_TEMP);
+    if(func_state > OFF_STATE){
+      if (this_temp < STEAMING_TEMPERATURE) {
+        //steam temp reached
+        temp_state = STEAM_READY;
+        SET_HEATER(0);
+      } else if (this_temp < BREWING_TEMPERATURE) {
+        //coffee temp reached
+        temp_state = COFFEE_READY;
+        if (func_state >= STEAM_STATE) {
+          SET_HEATER(1);
+        } else {
+          SET_HEATER(0);
+        }
+      } else if (func_state != COFFEE_BREWING) {
+        //machine is cold and not brewing
+        temp_state = COLD;
+        SET_HEATER(1);
+      }
+    }else{
+      SET_HEATER(0);
+    }
+  }
+
+  //set pump
+  if (func_state != COFFEE_BREWING) {
+    SET_PUMP(0);
+  }else{
+    SET_PUMP(1);
+  }
+
+  //calculate LED blink;
+  blinkframes += 1;
+  if(blinkframes > BLINK_FRAMES){
+    blinkylights=(blinkylights>0)?0:1;
+    blinkframes = 0;
+  }
+  
+  //set leds
+  if(func_state > OFF_STATE){
+    SET_PIN(PIN_LED_ON,1);
+    if(temp_state < COFFEE_READY){
+      SET_PIN(PIN_LED_COFFEE,blinkylights);
+    }else{
+      SET_PIN(PIN_LED_COFFEE,1);
+    }
+    if(func_state<=COFFEE_BREWING){
+      SET_PIN(PIN_LED_STEAM,0);
+    }else if(temp_state < STEAM_READY){
+      SET_PIN(PIN_LED_STEAM,blinkylights);
+    }else{
+      SET_PIN(PIN_LED_STEAM,1);
+    }
+    //SET_PIN(PIN_LED_STEAM, ((temp_state>=STEAM_READY)? 1 : 0) );
+    //SET_PIN(PIN_LED_COFFEE, ((temp_state>=COFFEE_READY)? 1 : 0) );
+  }else{
+    SET_PIN(PIN_LED_ON,0);
+    SET_PIN(PIN_LED_COFFEE,0);
+    SET_PIN(PIN_LED_STEAM,0);
+  }
+}
 
 //timing
-unsigned long LastDebounceTime = 0;
-unsigned long DebounceDelay = 50;
 unsigned long PumpShutoffTime = 0;
 unsigned long SteamShutoffTime = 0;
-unsigned long LoopTimer = 0;
 unsigned long LastButtonPress = 0;
 
 //setup arduino and turn everything off
 void setup() {
-  pinMode(PIN_HEATER,OUTPUT);
-  pinMode(PIN_PUMP,OUTPUT);
-  pinMode(PIN_LED_ON,OUTPUT);
-  pinMode(PIN_LED_COFFEE,OUTPUT);
-  pinMode(PIN_LED_STEAM,OUTPUT);
-  pinMode(PIN_BUTTONS,INPUT);
-  pinMode(PIN_TEMP,INPUT);
+  pinMode(PIN_HEATER, OUTPUT);
+  pinMode(PIN_PUMP, OUTPUT);
+  pinMode(PIN_LED_ON, OUTPUT);
+  pinMode(PIN_LED_COFFEE, OUTPUT);
+  pinMode(PIN_LED_STEAM, OUTPUT);
+  pinMode(PIN_BUTTONS, INPUT);
+  pinMode(PIN_TEMP, INPUT);
 
-  digitalWrite(PIN_LED_ON,HIGH);
-  digitalWrite(PIN_LED_COFFEE,HIGH);
-  digitalWrite(PIN_LED_STEAM,HIGH);
-  digitalWrite(PIN_HEATER,HIGH);
-  digitalWrite(PIN_PUMP,LOW);
+  SET_PIN(PIN_LED_ON,0);
+  SET_PIN(PIN_LED_COFFEE,0);
+  SET_PIN(PIN_LED_STEAM,0);
+  SET_PUMP(0);
+  SET_HEATER(0);
+  func_state=OFF_STATE;
+
+  ITimer1.init();
+  ITimer1.attachInterruptInterval(TIMER_INTERVAL_MS,TimerHandler);
 }
 
 //handle integer rollover
 unsigned long lastMillis = 0;
-unsigned long millisRollover(){
-  unsigned long currentMillis=millis();
-  return (unsigned long)(currentMillis-lastMillis);
+unsigned long millisRollover() {
+  unsigned long currentMillis = millis();
+  return (unsigned long)(currentMillis - lastMillis);
 }
 
-//produce a blink code for debugging, visual feedback, etc
-//takes hex-encoded integer
-//the low 3 nybbles correspond to each button's LED
-void blinkCode(int count,int blink_delay){
-  int count_100 = (count&0xF00) >> 8;
-  int count_10 = (count&0x0F0) >> 4;
-  int count_1 = count&0x00F;
-  for(int i = 0; i < count_100; i++){
-    digitalWrite(PIN_LED_ON,LOW);
-    delay(blink_delay);
-    digitalWrite(PIN_LED_ON,HIGH);
-    delay(blink_delay);
-  }
-  delay(blink_delay);
-  for(int i = 0; i < count_10; i++){
-    digitalWrite(PIN_LED_COFFEE,LOW);
-    delay(blink_delay);
-    digitalWrite(PIN_LED_COFFEE,HIGH);
-    delay(blink_delay);
-  }
-  delay(blink_delay);
-  for(int i = 0; i < count_1; i++){
-    digitalWrite(PIN_LED_STEAM,LOW);
-    delay(blink_delay);
-    digitalWrite(PIN_LED_STEAM,HIGH);
-    delay(blink_delay);
-  }
-  delay(blink_delay);
+void brewCycle() {
+  func_state = COFFEE_BREWING;
+  PumpShutoffTime = millisRollover() + BREW_DURATION;
 }
 
-//takes a raw value from the ADC
-//each button produces a different voltage using voltage dividers
-//tells you what button was pressed
-int buttonReadingToType(int reading){
-  int return_value = BTN_NONE;
-  
-  if( reading < BTN_VOLT_POWER )
-    return_value = BTN_POWER;
-  else if( reading < BTN_VOLT_COFFEE )
-    return_value = BTN_COFFEE;
-  else if( reading < BTN_VOLT_STEAM )
-    return_value = BTN_STEAM;
-
-  return return_value;
-}
-
-//reads data from the ADC pin connected to the buttons
-//debounces input using a timer
-void readButtons(){
-  int button_reading = analogRead(PIN_BUTTONS);
-
-  int button_state = buttonReadingToType(button_reading);
-
-  if( button_state != LastButtonState )
-    LastDebounceTime = millisRollover();
-
-  if ( ( millisRollover() - LastDebounceTime ) > DebounceDelay ){
-    if( button_state != ButtonState ) {
-      ButtonState = button_state;
-      parseButtons();
-    }
-  }
-
-  LastButtonState = button_state;
-}
-
-//makes sure the heater doesn't get too hot
-//reads the raw value at the ADC pin connected to the thermistor
-void regulateTemp(){
-  if(millisRollover() - LoopTimer > TEMP_REGULATION_DELAY){
-    LoopTimer = millisRollover();
-  }else{
-    return;
-  }
-
-  int this_temp = analogRead(PIN_TEMP);
-
-  if(this_temp < STEAMING_TEMPERATURE){
-    machineState|=(STEAM_TEMP|COFFEE_TEMP);
-    setHeater(0);
-    if((machineState&STEAM_TIME)==0){
-      blinkCode(0x2,200);
-    }
-  }else if(this_temp < BREWING_TEMPERATURE){
-    machineState|=COFFEE_TEMP;
-    machineState&=(~STEAM_TEMP);
-    if((machineState&STEAM_TIME) > 0){
-      blinkCode(0x2,100);
-      setHeater(1);
-    }else{
-      setHeater(0);
-    }
-  }else{
-    if((machineState&BREWING) == 0){
-      blinkCode(0x20,100);
-      machineState&=~(STEAM_TEMP|COFFEE_TEMP);
-      setHeater(1);
-    }
-  }
-}
-
-//turns the heater on, off, or toggles it
-void setHeater(int status){
-  switch(status){
-    case 0:
-      digitalWrite(PIN_HEATER,HIGH);
-      Heater = 0;
-      break;
-    case 1:
-      digitalWrite(PIN_HEATER,LOW);
-      Heater = 1;
-      break;
-    case 2:
-      if(Heater>0){
-        digitalWrite(PIN_HEATER,HIGH);
-        Heater = 0;
-      }else{
-        digitalWrite(PIN_HEATER,LOW);
-        Heater = 1;
-      }
-      break;
-  }
-}
-
-//turns the pump on, off, or toggles it
-void setPump(int status){
-  switch(status){
-    case 0:
-      digitalWrite(PIN_PUMP,LOW);
-      Pump = 0;
-      break;
-    case 1:
-      digitalWrite(PIN_PUMP,HIGH);
-      Pump = 1;
-      break;
-    case 2:
-      if(Pump>0){
-        digitalWrite(PIN_PUMP,LOW);
-        Pump = 0;
-      }else{
-        digitalWrite(PIN_PUMP,HIGH);
-        Pump = 1;
-      }
-      break;
-    default:
-      break;
-  }
-}
-
-//get some water in the lines and presoak the beans
-void preInfusion(){
-  setPump(1);
-  delay(2000);
-  setPump(0);
-  delay(200);
-  
-  setPump(1);
-  delay(100);
-  setPump(0);
-  delay(400);
-  
-  setPump(1);
-  delay(100);
-  setPump(0);
-  delay(400);
-  
-  setPump(1);
-  delay(100);
-  setPump(0);
-  delay(400);
-}
-
-void brewCycle(){
-  while((machineState&COFFEE_TEMP) < 0){
-    regulateTemp();
-    readButtons();
-    setLEDs();
-  }
-  preInfusion();
-  delay(2000);
-  setPump(1);
-  PumpShutoffTime = millisRollover()+BREW_DURATION;
+void steamCycle(){
+  func_state = STEAM_STATE;
+  SteamShutoffTime = millisRollover() + STEAM_DURATION;
 }
 
 //figures out what to do given the last pressed button
-void parseButtons(){
-  //keep track of last button press for auto shutdown
-  LastButtonPress = millisRollover();
-  //blink the LED that corresponds to the button pressed
-  switch(ButtonState){
-    case BTN_POWER:
-      blinkCode(0x500,30);
-      break;
-    case BTN_COFFEE:
-      blinkCode(0x050,30);
-      break;
-    case BTN_STEAM:
-      blinkCode(0x005,30);
-      break;
-    case BTN_NONE:
-    default:
-      break;
-  }
-  
+void parseButtons() {
   //handle buttons based on machine state
-  if((machineState&COFFEE_TIME) > 0){
-    switch(ButtonState){
-      case BTN_POWER:
-        shutDown();
-        break;
-      case BTN_COFFEE:
-        if((machineState&BREWING) > 0){
-          //stop brew cycle
-          machineState&=(~BREWING);
-          setPump(0);
-        }else{
-          //start brew cycle
-          machineState|=BREWING;
+  switch(func_state){
+    case OFF_STATE:
+      if(button_state > BTN_NONE){
+        func_state = COFFEE_STATE;
+      }
+      break;
+    case COFFEE_STATE:
+      switch(button_state){
+        case BTN_POWER:
+          func_state = OFF_STATE;
+          break;
+        case BTN_COFFEE:
           brewCycle();
-        }
-        break;
-      case BTN_STEAM:
-        blinkCode(0x005,30);
-        if((machineState&BREWING) > 0){
-          machineState&=(~BREWING);
-          setPump(0);
-        }
-        //start steaming
-        SteamShutoffTime = millisRollover()+STEAM_DURATION;
-        machineState|=STEAM_TIME;
-        machineState&=(~COFFEE_TIME);
-        break;
-    }
-  }else if((machineState&STEAM_TIME) > 0){
-    switch(ButtonState){
-      case BTN_POWER:
-        shutDown();
-        break;
-      case BTN_COFFEE:
-      case BTN_STEAM:
-        machineState&=(~STEAM_TIME);
-        machineState|=COFFEE_TIME;
-        break;
-    }
-  }else if(machineState == POWER_OFF){
-    //power is off, mode selector
-    switch(ButtonState){
-      case BTN_POWER:
-      //normal operation
-        startUp();
-        break;
-      //calibration modes
-    }
+          break;
+        case BTN_STEAM:
+          func_state = STEAM_STATE;
+          break;
+      }
+      break;
+    case COFFEE_BREWING:
+      switch(button_state){
+        case BTN_POWER:
+          func_state = OFF_STATE;
+          break;
+        case BTN_COFFEE:
+          func_state = COFFEE_STATE;
+          break;
+        case BTN_STEAM:
+          func_state = STEAM_STATE;
+          break;
+      }
+      break;
+    case STEAM_STATE:
+      switch(button_state){
+        case BTN_POWER:
+          func_state = OFF_STATE;
+          break;
+        case BTN_COFFEE:
+        case BTN_STEAM:
+          func_state = COFFEE_STATE;
+          break;
+      }
+      break;
   }
-}
-
-//sets the button LEDs depending on the current state of the machine
-void setLEDs(){
-  if(machineState==POWER_OFF){
-    digitalWrite(PIN_LED_ON,HIGH);
-    digitalWrite(PIN_LED_COFFEE,HIGH);
-    digitalWrite(PIN_LED_STEAM,HIGH);
-  }else if((machineState&(COFFEE_TIME|STEAM_TIME))>0){
-    digitalWrite(PIN_LED_ON,LOW);
-    if((machineState&COFFEE_TEMP)>0)
-      digitalWrite(PIN_LED_COFFEE,LOW);
-    else
-      digitalWrite(PIN_LED_COFFEE,HIGH);
-    if((machineState&STEAM_TEMP)>0)
-      digitalWrite(PIN_LED_STEAM,LOW);
-    else
-      digitalWrite(PIN_LED_STEAM,HIGH);
+  //clear button state since we handled it already
+  if(button_state > BTN_NONE){
+    button_state=BTN_NONE;
+    //keep track of last button press for auto shutdown
+    LastButtonPress = millisRollover();
   }
-}
-
-//turn everything off
-void shutDown(){
-  machineState=POWER_OFF;
-  setHeater(0);
-  setPump(0);
-}
-
-//boot up the machine
-void startUp(){
-  machineState=COFFEE_TIME;
-  preInfusion();
 }
 
 //turns off the pump if brew time is up
-void checkBrew(){
-  if( (millisRollover() - PumpShutoffTime) < ONE_SECOND ){
-    setPump(0);
-    machineState&=(~BREWING);
+void checkBrew() {
+  if ( (millisRollover() - PumpShutoffTime) < ONE_SECOND ) {
+    func_state = COFFEE_STATE;
   }
 }
 
 //stops the steam heating if steam time is up
-void checkSteam(){
-  if( (millisRollover() - SteamShutoffTime) < ONE_SECOND ){
-    machineState&=(~STEAM_TIME);
-    machineState|=COFFEE_TIME;
+void checkSteam() {
+  if ( (millisRollover() - SteamShutoffTime) < ONE_SECOND ) {
+    func_state = COFFEE_STATE;
   }
 }
 
 void loop() {
-  if(machineState>POWER_OFF){
+  if (func_state > OFF_STATE) {
     //if machine is on do these
-    regulateTemp();
-    if((machineState&STEAM_TIME) > 1)
+    if (func_state == STEAM_STATE)
       checkSteam();
-    if((machineState&BREWING) > 1)
+    if (func_state == COFFEE_BREWING)
       checkBrew();
     //auto shutdown
-    if(millisRollover() - LastButtonPress > AUTO_SHUTDOWN_TIME){
-      shutDown();
+    if (millisRollover() - LastButtonPress > AUTO_SHUTDOWN_TIME) {
+      func_state = OFF_STATE;
     }
   }
   //always do these
-  readButtons();
-  setLEDs();
+  parseButtons();
 }
