@@ -46,13 +46,14 @@ Ground           GND            D0
 
 ## Current features:
 * Heater is regulated (~90°C for coffee, ~100°C for steam)
-* Pump is primed on startup and at the beginning of a brewing cycle
+* ~~Pump is primed on startup and at the beginning of a brewing cycle
 * Two main power states are handled (on and off)
 * Front panel buttons control operation modes and are debounced
 * Power, heater and operation mode status is indicated by the LED's (solid, blinking, or off)
-* Brewing cycle ends automatically after 40 seconds
+* Brewing cycle ends automatically after 20 seconds
 * Steam cycle ends automatically after 5 minutes
 * Timed automatic shut-off after 15 minutes
+* Input sampling, temperature regulation, pump control and LED status are handled with a timer interrupt
 
 ## Todo:
 * Connect a buzzer to the arduino and provide aural feedback
