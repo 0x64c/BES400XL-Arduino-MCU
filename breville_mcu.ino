@@ -6,15 +6,16 @@
 
 //time durations in ms
 #define STEAM_DURATION 300000
-#define BREW_DURATION 18000
+#define BREW_DURATION 40000
 #define ONE_SECOND 1000
 #define AUTO_SHUTDOWN_TIME 900000
 #define TIMER_INTERVAL_MS 20
 
 //time constants in frames
-#define BLINK_FRAMES 25
-#define MIN_STABLE_FRAMES 10
-#define HEATER_FRAMES 40
+#define BLINK_FRAMES 5
+#define MIN_STABLE_FRAMES 3
+#define MIN_LONGPRESS_FRAMES 50//full second
+#define HEATER_FRAMES 30
 
 //pin values
 #define PIN_HEATER 8
@@ -31,9 +32,14 @@
 #define BTN_VOLT_COFFEE 0x200
 #define BTN_VOLT_STEAM  0x300
 #define BTN_VOLT_NONE   0x400
-//thermistor
-#define BREWING_TEMPERATURE 0x200
-#define STEAMING_TEMPERATURE 0x148
+
+//thermistor temperature values
+//ADC readings were calculated using the linear equation (A-T)/B, where A=124.22, B=0.08, T=actual temperature in Celcius degrees
+//this equation was derived from temperatures measured with a thermocouple placed near the thermistor, collected for various ADC target values
+#define STEAMING_TEMPERATURE 0x12F//100
+#define MAX_TEMPERATURE_INDEX 3
+int temp_index = 0;
+int brewing_temperatures[MAX_TEMPERATURE_INDEX+1]={0x1EA,0x1AC,0x186,0x15F};//85,90,93,96
 
 //helpful macros
 #define SET_PIN(b,a) digitalWrite(b,((a > 0) ? LOW : HIGH))
@@ -57,6 +63,7 @@
 
 //machine status
 volatile int button_state = BTN_NONE;
+volatile int button_longpress = 0;
 volatile int func_state = OFF_STATE;
 volatile int temp_state = COLD;
 
@@ -74,6 +81,8 @@ void TimerHandler()
   //led
   static int blinkframes;
   static int blinkylights;
+  static int blinkylights2;
+  static int blink_counter;
 
   //initialize local variables
   if(!isr_started){
@@ -81,6 +90,8 @@ void TimerHandler()
     frames_stable = 0;
     blinkframes = 0;
     blinkylights = 0;
+    blinkylights2 = 0;
+    blink_counter = 0;
     heaterframes = 0;
     button_reading = BTN_VOLT_NONE;
     this_button_state = BTN_NONE;
@@ -101,16 +112,25 @@ void TimerHandler()
     this_button_state = BTN_NONE;
   }
 
+  //if button has been pressed and released, check if it was a short or long press and store it in global
+  if(this_button_state==BTN_NONE && last_button_state>BTN_NONE){
+    if(frames_stable > MIN_LONGPRESS_FRAMES){
+      //button was a long press
+      button_longpress = 1;
+    }else{
+      button_longpress = 0;
+    }
+    //button was pressed long enough to register, so store the value
+    if(frames_stable > MIN_STABLE_FRAMES){
+      button_state = last_button_state;
+    }
+  }
+
   //keep track of how many frames the button state has been stable for
   if(this_button_state==last_button_state){
     frames_stable += 1;
   }else{
     frames_stable = 0;
-  }
-
-  //if button state has been stable for long enough, store the value in global
-  if(frames_stable == MIN_STABLE_FRAMES){
-    button_state = this_button_state;
   }
 
   //store the last button state
@@ -127,7 +147,7 @@ void TimerHandler()
         //steam temp reached
         temp_state = STEAM_READY;
         SET_HEATER(0);
-      } else if (this_temp < BREWING_TEMPERATURE) {
+      } else if (this_temp < brewing_temperatures[temp_index]){ 
         //coffee temp reached
         temp_state = COFFEE_READY;
         if (func_state >= STEAM_STATE) {
@@ -135,8 +155,7 @@ void TimerHandler()
         } else {
           SET_HEATER(0);
         }
-      } else if (func_state != COFFEE_BREWING) {
-        //machine is cold and not brewing
+      } else {
         temp_state = COLD;
         SET_HEATER(1);
       }
@@ -155,14 +174,31 @@ void TimerHandler()
   //calculate LED blink;
   blinkframes += 1;
   if(blinkframes > BLINK_FRAMES){
+    //steam/coffee LED blink
     blinkylights=(blinkylights>0)?0:1;
     blinkframes = 0;
+
+    //power LED blink
+    blink_counter+=1;
+    blinkylights2=blinkylights;
+    if(temp_index==0){
+      blinkylights2=1;
+    }else{
+      if(blink_counter > 2*temp_index+2){
+        blinkylights2=0;
+        if(blink_counter > 2*(temp_index)+3){
+          blink_counter=0;
+        }
+      }
+    }
   }
   
   //set leds
   if(func_state > OFF_STATE){
-    SET_PIN(PIN_LED_ON,1);
+    //blink power LED to indicate selected temperature
+    SET_PIN(PIN_LED_ON,blinkylights2);
     if(temp_state < COFFEE_READY){
+      //blink coffee LED to indicate temperature below target
       SET_PIN(PIN_LED_COFFEE,blinkylights);
     }else{
       SET_PIN(PIN_LED_COFFEE,1);
@@ -170,6 +206,7 @@ void TimerHandler()
     if(func_state<=COFFEE_BREWING){
       SET_PIN(PIN_LED_STEAM,0);
     }else if(temp_state < STEAM_READY){
+      //blink steam LED to indicate temperature below target
       SET_PIN(PIN_LED_STEAM,blinkylights);
     }else{
       SET_PIN(PIN_LED_STEAM,1);
@@ -205,6 +242,7 @@ void setup() {
   SET_HEATER(0);
   func_state=OFF_STATE;
 
+  //setup start interrupt timer code
   ITimer1.init();
   ITimer1.attachInterruptInterval(TIMER_INTERVAL_MS,TimerHandler);
 }
@@ -233,6 +271,7 @@ void parseButtons() {
     case OFF_STATE:
       if(button_state > BTN_NONE){
         func_state = COFFEE_STATE;
+        temp_index = 0;
       }
       break;
     case COFFEE_STATE:
@@ -244,7 +283,19 @@ void parseButtons() {
           brewCycle();
           break;
         case BTN_STEAM:
-          func_state = STEAM_STATE;
+          //increment index of selected target temperature
+          //when max index is reached, switch to steam mode
+          if(button_longpress>0){
+            steamCycle();
+            temp_index = 0;
+          }else{
+            temp_index+=1;
+            if(temp_index>MAX_TEMPERATURE_INDEX){
+              temp_index = 0;
+            }
+          }
+          //temp_setting = (temp_setting>3) ? (0) : (temp_setting+1);
+          //temp_setting += 1;//temperature_target -= 0x1;//func_state = STEAM_STATE;
           break;
       }
       break;
@@ -257,7 +308,7 @@ void parseButtons() {
           func_state = COFFEE_STATE;
           break;
         case BTN_STEAM:
-          func_state = STEAM_STATE;
+          func_state = COFFEE_STATE;
           break;
       }
       break;
@@ -269,6 +320,7 @@ void parseButtons() {
         case BTN_COFFEE:
         case BTN_STEAM:
           func_state = COFFEE_STATE;
+          temp_index = 0;
           break;
       }
       break;
@@ -276,6 +328,7 @@ void parseButtons() {
   //clear button state since we handled it already
   if(button_state > BTN_NONE){
     button_state=BTN_NONE;
+    //button_longpress=0;
     //keep track of last button press for auto shutdown
     LastButtonPress = millisRollover();
   }
